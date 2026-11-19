@@ -1,5 +1,5 @@
 // Token Radar's dashboard: it reads window.RADAR (written beside dashboard/ by main.ts) and renders
-// the ranked board, per-protocol detail and farm plan, the live-token comparables and the model's own
+// the ranked board, a full detail page per protocol, the live-token comparables and the model's own
 // benchmark table. No framework and no network: every byte it shows is in data.js.
 (function () {
   'use strict';
@@ -22,7 +22,7 @@
   function fmtFull(n) { return isFinite(n) ? money.format(n) : 'n/a'; }
   function fmtPct(n) {
     if (n === null || n === undefined || !isFinite(n)) return 'n/a';
-    return (n > 0 ? '+' : n < 0 ? '' : '') + n.toFixed(1) + '%';
+    return (n > 0 ? '+' : '') + n.toFixed(1) + '%';
   }
   function fmtAge(days) {
     if (days === null || days === undefined) return 'unknown';
@@ -43,6 +43,64 @@
     return { growth: growth, growthMult: growthMult, maturity: maturity, implied: implied };
   }
   function impliedOf(row) { return parts(row, 0, 1, 0).implied; }
+
+  // Confidence says how well the snapshot supports the inputs, never how likely a token is.
+  function confidence(row) {
+    var score = 45;
+    var peers = row.category_peers;
+    var reasons = [];
+    if (peers >= 8) { score += 18; reasons.push(peers + ' live-token peers set the category multiple'); }
+    else if (peers >= 4) { score += 12; reasons.push(peers + ' live-token peers set the category multiple'); }
+    else if (peers >= 1) { score += 3; reasons.push('Only ' + peers + ' live-token peer' + (peers === 1 ? '' : 's') + ' set the category multiple'); }
+    else { score -= 10; reasons.push('No live-token peer, so the whole market\u2019s multiple stands in'); }
+    if (row.listed_at !== null) { score += 8; reasons.push('Listed ' + fmtAge(row.age_days) + ' with no token'); }
+    else { score -= 9; reasons.push('No listing date: age is credited a default ' + M.unknown_age_days + ' days'); }
+    if (row.change_7d === null) { score -= 5; reasons.push('No seven-day TVL change is reported'); }
+    else { score += 5; reasons.push('Seven-day TVL change is reported at ' + fmtPct(row.change_7d)); }
+    if (row.tvl_usd >= 1e9) score += 10;
+    else if (row.tvl_usd >= 3e8) score += 6;
+    else if (row.tvl_usd >= 1e8) score += 3;
+    reasons.push('TVL of ' + fmtUsd(row.tvl_usd) + ' is the base of the estimate');
+    score = Math.max(18, Math.min(93, Math.round(score)));
+    return {
+      score: score,
+      level: score >= 74 ? 'High' : score >= 55 ? 'Medium' : 'Low',
+      cls: score >= 74 ? 'high' : score >= 55 ? 'med' : 'low',
+      reasons: reasons
+    };
+  }
+
+  // Risks are read off the row's own record first, then the two that hold for every row.
+  function risks(row) {
+    var out = [];
+    var cat = row.category || 'Uncategorised';
+    if (row.category_peers === 0) out.push('No protocol in ' + cat + ' trades yet, so the multiple is the whole market\u2019s median rather than the category\u2019s own.');
+    else if (row.category_peers < 3) out.push('The ' + cat + ' multiple rests on ' + row.category_peers + ' live peer' + (row.category_peers === 1 ? '' : 's') + ', so one outlier moves the value.');
+    if (row.listed_at === null) out.push('The record has no listing date, so maturity assumes ' + M.unknown_age_days + ' days; the true age may be shorter or longer.');
+    if (row.change_7d === null) out.push('No seven-day change is recorded, so momentum counts as 0% and a recent TVL move is not priced.');
+    else if (row.change_7d <= -10) out.push('TVL fell ' + fmtPct(row.change_7d) + ' over seven days; the momentum term trims the value and the fall may continue.');
+    if (row.tvl_usd < 1e8) out.push('TVL of ' + fmtUsd(row.tvl_usd) + ' is thin enough that one depositor can move it, and this rank with it.');
+    if (row.chains.length > 3) out.push('Contracts on ' + row.chains.length + ' chains widen the surface: more bridges, more approvals, more ways to lose the position.');
+    out = out.slice(0, 4);
+    out.push('DefiLlama lists no token for ' + row.name + '; that is a record, not proof that no token exists.');
+    out.push('The plan earns nothing by itself: no points, airdrop or launch is promised, and the capital stays at risk while you hold.');
+    return out;
+  }
+
+  // Rough totals for the plan, read back off the generated steps rather than invented again.
+  function planTotals(row) {
+    var s = row.farm_steps || [];
+    var cap = /\$(\d[\d,]*)/.exec(s[1] ? s[1].act : '');
+    var gas = /\$(\d[\d,]*)/.exec(s[2] ? s[2].cost : '');
+    var hold = /(\d+) days/.exec(s[3] ? s[3].act : '');
+    return { capital: cap ? cap[1] : null, gas: gas ? gas[1] : null, hold: hold ? hold[1] : null };
+  }
+
+  function benchmarkFor(cat) {
+    var hit = null;
+    DATA.benchmarks.forEach(function (b) { if (b.category === (cat || 'Other')) hit = b; });
+    return hit;
+  }
 
   function el(tag, attrs) {
     var node = document.createElement(tag);
@@ -132,7 +190,7 @@
       tabs.map(function (t) {
         return el('button', {
           type: 'button', role: 'tab', 'aria-selected': state.tab === t[0] ? 'true' : 'false',
-          onclick: function () { state.tab = t[0]; writeHash(); render(); }
+          onclick: function () { state.tab = t[0]; state.selected = null; writeHash(); render(); }
         }, t[1], el('b', { text: String(t[2]) }));
       })
     );
@@ -200,12 +258,18 @@
           else { state.sort = key; state.dir = key === 'name' || key === 'age' ? 1 : -1; }
           writeHash(); render();
         }
-      }, label, active ? el('span', { class: 'caret', 'aria-hidden': 'true', text: state.dir < 0 ? '▼' : '▲' }) : null)
+      }, label, active ? el('span', { class: 'caret', 'aria-hidden': 'true', text: state.dir < 0 ? '\u25bc' : '\u25b2' }) : null)
     );
   }
 
   function detailButton(slug) {
     return function () { state.selected = slug; writeHash(); openDetail(slug); };
+  }
+
+  function confidencePill(row) {
+    var c = confidence(row);
+    return el('span', { class: 'pill ' + c.cls, title: 'Confidence score ' + c.score + ' of 100' },
+      el('i', { 'aria-hidden': 'true' }), c.level);
   }
 
   function boardTable() {
@@ -225,7 +289,8 @@
     list.forEach(function (r) {
       var growth = r.change_7d === null ? 'n/a' : fmtPct(r.change_7d);
       var growthCls = r.change_7d === null ? 'muted' : r.change_7d >= 0 ? 'pos' : 'neg';
-      var pct = Math.max(4, Math.round((r.implied_value_usd / max) * 100));
+      // A square-root scale keeps the tail of the board visible next to the leaders.
+      var pct = Math.max(3, Math.round(Math.sqrt(r.implied_value_usd / max) * 100));
       tbody.appendChild(el('tr', {
         class: 'row', tabindex: '0',
         onclick: detailButton(r.slug),
@@ -234,23 +299,24 @@
         el('td', { class: 'rank' + (r.rank <= 3 ? ' top' : ''), text: String(r.rank) }),
         el('td', null, el('div', { class: 'proto' },
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Uncategorised') + ' · ' + (r.chains.length ? r.chains[0] + (r.chains.length > 1 ? ' +' + (r.chains.length - 1) : '') : 'chain unnamed') })
+          el('span', { class: 'sub', text: (r.category || 'Uncategorised') + ' \u00b7 ' + (r.chains.length ? r.chains[0] + (r.chains.length > 1 ? ' +' + (r.chains.length - 1) : '') : 'chain unnamed') })
         )),
         el('td', { class: 'col-scope' }, el('span', { class: 'scope ' + (r.on_watchlist ? 'watch' : 'early'), text: r.on_watchlist ? 'watchlist' : 'off-watchlist' })),
         el('td', { class: 'num col-tvl', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + growthCls, text: growth }),
         el('td', { class: 'num', text: fmtAge(r.age_days) }),
+        el('td', { class: 'col-conf' }, confidencePill(r)),
         el('td', null, el('div', { class: 'implied' },
           el('div', { class: 'bar' + (r.rank <= 3 ? ' hot' : ''), 'aria-hidden': 'true' }, el('i', { style: 'width:' + pct + '%' })),
           el('b', { text: fmtUsd(r.implied_value_usd) })
         )),
-        el('td', { class: 'chev', 'aria-hidden': 'true', text: '›' })
+        el('td', { class: 'chev', 'aria-hidden': 'true', text: '\u203a' })
       ));
     });
     return el('div', { class: 'panel' },
       el('div', { class: 'table-wrap' },
         el('table', null,
-          el('caption', { text: 'Ranked by implied value. Click a row for the model behind it and a farm plan with costs and times.' }),
+          el('caption', { text: 'Ranked by implied value. The bar follows the square root of each value against the largest row, so the tail stays readable. Open a row for its inputs, the value reasoning, confidence, risks and a farm plan with costs and times.' }),
           el('thead', null, el('tr', null,
             sortHeader('implied', 'Rank', 'rank'),
             sortHeader('name', 'Protocol'),
@@ -258,12 +324,37 @@
             sortHeader('tvl', 'TVL', 'col-tvl'),
             sortHeader('growth', '7 day'),
             sortHeader('age', 'No token for'),
+            el('th', { scope: 'col', class: 'col-conf', text: 'Confidence' }),
             sortHeader('implied', 'Implied value'),
             el('th', { scope: 'col' }, el('span', { class: 'sub', text: 'Plan' }))
           )),
           tbody
         )
       )
+    );
+  }
+
+  function howItWorks() {
+    var steps = [
+      ['Find', 'Every protocol with no token in the DefiLlama record, minus wraps, stakes, bridges, exchange products and versioned pools, down to ' + fmtUsd(DATA.floor_usd) + '.'],
+      ['Price', 'TVL times the category\u2019s live median market-cap-to-TVL, shrunk toward the market median, then seven-day growth and time with no token.'],
+      ['Farm', 'Open a row for its inputs, the arithmetic, a confidence level, the risks and eight steps with a rough cost and time.']
+    ];
+    return el('section', { class: 'how', id: 'how-it-works' },
+      el('div', { class: 'how-head' },
+        el('h2', { text: 'How it works' }),
+        el('p', { text: 'One sealed snapshot, one measured multiple per category, three inputs per protocol.' })
+      ),
+      el('div', { class: 'how-steps' }, steps.map(function (s, i) {
+        return el('div', { class: 'how-step' },
+          el('span', { class: 'how-n', 'aria-hidden': 'true', text: String(i + 1) }),
+          el('div', null, el('h3', { text: s[0] }), el('p', { text: s[1] }))
+        );
+      })),
+      el('button', {
+        type: 'button', class: 'link', text: 'Full method \u2192',
+        onclick: function () { state.tab = 'method'; state.selected = null; writeHash(); render(); }
+      })
     );
   }
 
@@ -275,7 +366,7 @@
       tbody.appendChild(el('tr', null,
         el('td', null, el('div', { class: 'proto' },
           el('b', { text: r.name }),
-          el('span', { class: 'sub', text: (r.category || 'Uncategorised') + ' · ' + (r.chains.length ? r.chains[0] : 'chain unnamed') })
+          el('span', { class: 'sub', text: (r.category || 'Uncategorised') + ' \u00b7 ' + (r.chains.length ? r.chains[0] : 'chain unnamed') })
         )),
         el('td', { class: 'num', text: fmtUsd(r.tvl_usd) }),
         el('td', { class: 'num ' + (r.change_7d === null ? 'muted' : r.change_7d >= 0 ? 'pos' : 'neg'), text: r.change_7d === null ? 'n/a' : fmtPct(r.change_7d) }),
@@ -372,7 +463,7 @@
         el('p', { text: 'A wrapped, staked or bridged product of a token that already trades is not a launch of its own. Neither is an exchange\u2019s product or a versioned pool of another protocol. The snapshot names ' + DATA.excluded_size + ' such protocols above the floor; the largest ' + DATA.excluded.length + ' are listed here, so the board\u2019s coverage can be checked rather than trusted.' }),
         el('ul', { class: 'rules' },
           el('li', null, 'The watchlist is the floor: ', el('code', { text: String(Math.round(DATA.floor_usd / 1e6)) + 'M' }), ' of TVL, no token in the DefiLlama record, and not a product of one that trades.'),
-          el('li', null, 'The board is a superset: ', el('code', { text: String(DATA.board_size) + ' rows' }), ' including every watchlist protocol and ', el('code', { text: String(DATA.early_size) }), ' tokenless protocols the watchlist leaves out, down to the snapshot\u2019s ' + fmtUsd(5000000) + ' input floor.'),
+          el('li', null, 'The board is a superset: ', el('code', { text: String(DATA.board_size) + ' rows' }), ' including every watchlist protocol and ', el('code', { text: String(DATA.early_size) }), ' tokenless protocols the watchlist leaves out, down to the snapshot\u2019s ' + fmtUsd(DATA.floor_usd) + ' input floor.'),
           el('li', null, '\u201cNo token\u201d is always the record\u2019s word, never proof: a protocol on the board may still carry a token DefiLlama does not list.')
         ),
         el('div', { class: 'panel' },
@@ -399,66 +490,134 @@
     var row = DATA.rows.filter(function (r) { return r.slug === slug; })[0];
     if (!row) return;
     dialog.textContent = '';
-    var options = [0, 1, 2, 3, 4, 5, 6, 7].map(function (i) { return row.farm_steps[i]; }).filter(Boolean);
+    var steps = row.farm_steps || [];
+    var c = confidence(row);
+    var riskList = risks(row);
+    var totals = planTotals(row);
+    var bench = benchmarkFor(row.category);
+    var max = DATA.rows[0].implied_value_usd || 1;
+    var share = Math.max(1, Math.round((row.implied_value_usd / max) * 100));
+    var chains = row.chains.length ? row.chains.join(', ') : 'chain unnamed';
+    var peers = row.category_peers === 0 ? 'no live peers, market median' : row.category_peers + ' live peer' + (row.category_peers === 1 ? '' : 's');
+
     var sens = [
       ['TVL 25% lower', parts(row, 0, 0.75, 0).implied],
       ['Growth 20 points lower', parts(row, -20, 1, 0).implied],
       ['One year younger', parts(row, 0, 1, -Math.min(365, row.age_days === null ? M.unknown_age_days : row.age_days)).implied]
     ];
-    var chains = row.chains.length ? row.chains.slice(0, 4).join(', ') + (row.chains.length > 4 ? ' +' + (row.chains.length - 4) : '') : 'chain unnamed';
-    var plan = el('ol', { class: 'plan' }, options.map(function (s) {
-      return el('li', null, el('div', null,
-        el('p', { text: s.act }),
-        el('div', { class: 'cost' },
-          el('em', { text: 'Cost: ' + s.cost }),
-          el('em', { class: 'time', text: 'Time: ' + s.time })
+
+    var reasonRows = [
+      ['TVL', fmtFull(row.tvl_usd), 'the snapshot\u2019s TVL record for ' + DATA.as_of],
+      ['Category multiple', '\u00d7' + row.category_multiple.toFixed(2), (row.category || 'Uncategorised') + ' \u00b7 ' + peers + (bench ? ', median x' + bench.median_multiple.toFixed(2) + ' shrunk toward the market' : ', shrunk toward the market median')],
+      ['Momentum', '\u00d7' + row.growth_multiplier.toFixed(3), row.change_7d === null ? 'no seven-day change, counted as 0%' : fmtPct(row.change_7d) + ' over seven days, clamped and weighted ' + M.growth_weight],
+      ['Maturity', '\u00d7' + row.maturity_multiplier.toFixed(3), row.listed_at === null ? 'no listing date, credited ' + M.unknown_age_days + ' days' : fmtAge(row.age_days) + ' with no token since ' + row.listed_at]
+    ];
+
+    var plan = el('ol', { class: 'plan' }, steps.map(function (s) {
+      return el('li', null,
+        el('div', null,
+          el('p', { text: s.act }),
+          el('div', { class: 'cost' },
+            el('em', { text: 'Cost: ' + s.cost }),
+            el('em', { class: 'time', text: 'Time: ' + s.time })
+          )
         )
-      ));
+      );
     }));
-    var peers = row.category_peers === 0 ? 'no live peers, market median' : row.category_peers + ' live peer' + (row.category_peers === 1 ? '' : 's');
+
     var body = el('div', { class: 'detail-inner' },
       el('div', { class: 'detail-head' },
-        el('div', null,
-          el('div', { class: 'rankline', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.on_watchlist ? ' · watchlist' : ' · off-watchlist') }),
-          el('h2', { id: 'detail-title', text: row.name }),
-          el('p', { class: 'sub', text: (row.category || 'Uncategorised') + ' · ' + chains })
+        el('div', { class: 'detail-title' },
+          el('button', { class: 'back', type: 'button', text: '\u2190 Back to the board', onclick: function () { dialog.close(); } }),
+          el('div', { class: 'rankline', text: 'Rank ' + row.rank + ' of ' + DATA.board_size + (row.on_watchlist ? ' \u00b7 watchlist' : ' \u00b7 off-watchlist') }),
+          el('h1', { id: 'detail-title', text: row.name }),
+          el('p', { class: 'sub', text: (row.category || 'Uncategorised') + ' \u00b7 ' + chains })
         ),
-        el('button', { class: 'close', type: 'button', 'aria-label': 'Close details', text: 'Close', onclick: function () { dialog.close(); } })
-      ),
-      el('div', { class: 'big' },
-        el('span', { class: 'label', text: 'Implied launch value' }),
-        el('span', { class: 'value', text: fmtUsd(row.implied_value_usd) }),
-        el('span', { class: 'note', text: fmtFull(row.implied_value_usd) + ' · the model\u2019s claim, not a price' })
-      ),
-      el('dl', { class: 'breakdown' },
-        el('div', null, el('dt', { text: 'TVL' }), el('dd', null, fmtFull(row.tvl_usd), el('small', { text: chains }))),
-        el('div', null,
-          el('dt', { text: 'Category multiple' }),
-          el('dd', null, '×' + row.category_multiple.toFixed(2), el('small', { text: (row.category || 'Uncategorised') + ' · ' + peers }))
+        el('div', { class: 'value-hero' },
+          el('span', { class: 'label', text: 'Implied launch value' }),
+          el('span', { class: 'value', text: fmtUsd(row.implied_value_usd) }),
+          el('span', { class: 'note', text: fmtFull(row.implied_value_usd) + ' \u00b7 the model\u2019s claim, not a price' }),
+          el('div', { class: 'bar' + (row.rank <= 3 ? ' hot' : ''), 'aria-hidden': 'true' }, el('i', { style: 'width:' + share + '%' })),
+          el('span', { class: 'note', text: share + '% of the board\u2019s largest implied value' })
         ),
-        el('div', null,
-          el('dt', { text: 'Seven-day growth' }),
-          el('dd', null, '×' + row.growth_multiplier.toFixed(3),
-            el('small', { text: row.change_7d === null ? 'not reported, counted as 0%' : fmtPct(row.change_7d) + ' over 7 days' }))
+        el('button', { class: 'close', type: 'button', 'aria-label': 'Back to the board', text: 'Close', onclick: function () { dialog.close(); } })
+      ),
+      el('div', { class: 'detail-grid' },
+        el('div', { class: 'detail-main' },
+          el('section', { class: 'block' },
+            el('h2', { text: 'Value reasoning' }),
+            el('p', { class: 'lead', text: 'Every figure below comes from the snapshot row; the page multiplies the same four terms the model does, for every protocol.' }),
+            el('table', { class: 'reason' },
+              el('thead', null, el('tr', null,
+                el('th', { scope: 'col', text: 'Input' }),
+                el('th', { scope: 'col', text: 'Factor' }),
+                el('th', { scope: 'col', text: 'Where it comes from' })
+              )),
+              el('tbody', null, reasonRows.map(function (r) {
+                return el('tr', null,
+                  el('td', { text: r[0] }),
+                  el('td', { class: 'num factor', text: r[1] }),
+                  el('td', { class: 'sub', text: r[2] })
+                );
+              }), el('tr', { class: 'result' },
+                el('td', { text: 'Implied value' }),
+                el('td', { class: 'num factor', text: fmtUsd(row.implied_value_usd) }),
+                el('td', { class: 'sub', text: 'TVL \u00d7 multiple \u00d7 momentum \u00d7 maturity' })
+              ))
+            ),
+            el('p', { class: 'block-note' },
+              'TVL of ' + fmtUsd(row.tvl_usd) + ' earns the ' + (row.category || 'Uncategorised') + ' multiple of \u00d7' + row.category_multiple.toFixed(2) + ' that ' + peers + ' support; ' + (row.change_7d === null ? 'a missing seven-day change' : 'seven-day growth of ' + fmtPct(row.change_7d)) + ' moves it to \u00d7' + row.growth_multiplier.toFixed(3) + ', and ' + (row.age_days === null ? 'a credited age' : fmtAge(row.age_days) + ' without a token') + ' moves it to \u00d7' + row.maturity_multiplier.toFixed(3) + '. No protocol name is special-cased.'
+            ),
+            el('h3', { class: 'sub-head', text: 'If the inputs moved' }),
+            el('div', { class: 'sens' }, sens.map(function (s) {
+              return el('div', null, el('span', { text: s[0] }), el('b', { text: fmtUsd(s[1]) }));
+            }))
+          ),
+          el('section', { class: 'block' },
+            el('h2', { text: 'Farm plan' }),
+            el('p', { class: 'lead' },
+              'Eight steps for ' + row.name + ' on ' + (row.chains[0] || 'its main chain') + ', sized to its TVL and age. Costs are rough: gas is priced per chain and the hold window fits how young the protocol is.'
+            ),
+            el('div', { class: 'plan-sum' },
+              el('div', null, el('span', { text: 'Capital at risk' }), el('b', { text: totals.capital ? '$' + totals.capital : 'see step 2' })),
+              el('div', null, el('span', { text: 'Weekly gas' }), el('b', { text: totals.gas ? 'about $' + totals.gas : 'about $2-6' })),
+              el('div', null, el('span', { text: 'Minimum hold' }), el('b', { text: totals.hold ? totals.hold + ' days' : 'a full cycle' }))
+            ),
+            plan
+          )
         ),
-        el('div', null,
-          el('dt', { text: 'Time with no token' }),
-          el('dd', null, '×' + row.maturity_multiplier.toFixed(3),
-            el('small', { text: row.age_days === null ? 'no listing date, credited ' + M.unknown_age_days + ' days' : fmtAge(row.age_days) + ' since ' + row.listed_at }))
-        ),
-        el('div', { class: 'total' }, el('dt', { text: 'Implied value' }), el('dd', { text: fmtFull(row.implied_value_usd) }))
+        el('aside', { class: 'detail-side' },
+          el('section', { class: 'block card' },
+            el('h2', { text: 'Snapshot inputs' }),
+            el('dl', { class: 'inputs' },
+              el('div', null, el('dt', { text: 'Category' }), el('dd', { text: row.category || 'Uncategorised' })),
+              el('div', null, el('dt', { text: 'TVL' }), el('dd', { class: 'num', text: fmtFull(row.tvl_usd) })),
+              el('div', null, el('dt', { text: 'Seven-day change' }), el('dd', { class: 'num', text: row.change_7d === null ? 'not reported' : fmtPct(row.change_7d) })),
+              el('div', null, el('dt', { text: 'Listed at' }), el('dd', { class: 'num', text: row.listed_at || 'not reported' })),
+              el('div', null, el('dt', { text: 'Time with no token' }), el('dd', { class: 'num', text: fmtAge(row.age_days) })),
+              el('div', null, el('dt', { text: 'Chains' }), el('dd', { text: chains })),
+              el('div', null, el('dt', { text: 'Watchlist' }), el('dd', { text: row.on_watchlist ? 'yes, on the 40 protocol watchlist' : 'no, found beyond the watchlist' })),
+              el('div', null, el('dt', { text: 'Slug' }), el('dd', { class: 'mono', text: row.slug }))
+            ),
+            el('p', { class: 'block-note', text: 'Token record: no market cap, GeckoTerminal id or symbol, which is what puts the protocol on this board. That is DefiLlama\u2019s record, not proof no token exists.' })
+          ),
+          el('section', { class: 'block card' },
+            el('h2', { text: 'Confidence' }),
+            el('div', { class: 'conf-head' },
+              el('b', { class: 'conf-level ' + c.cls, text: c.level }),
+              el('span', { class: 'conf-score', text: c.score + ' / 100' })
+            ),
+            el('div', { class: 'conf-meter', 'aria-hidden': 'true' }, el('i', { class: 'conf-fill ' + c.cls, style: 'width:' + c.score + '%' })),
+            el('p', { class: 'block-note', text: 'How well the snapshot supports the inputs, not how likely a launch is.' }),
+            el('ul', { class: 'reasons' }, c.reasons.map(function (r) { return el('li', { text: r }); }))
+          ),
+          el('section', { class: 'block card' },
+            el('h2', { text: 'Risks' }),
+            el('ul', { class: 'risks' }, riskList.map(function (r) { return el('li', { text: r }); }))
+          )
+        )
       ),
-      el('section', null,
-        el('h3', { text: 'If the inputs moved' }),
-        el('div', { class: 'sens' }, sens.map(function (s) {
-          return el('div', null, el('span', { text: s[0] }), el('b', { text: fmtUsd(s[1]) }));
-        }))
-      ),
-      el('section', null,
-        el('h3', { text: 'Farm plan: before the token, and on launch day' }),
-        plan
-      ),
-      el('p', { class: 'detail-note', text: 'The page recomputes this row from the snapshot figures as ' + fmtUsd(impliedOf(row)) + (impliedOf(row) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' DefiLlama lists no token for this protocol: that is a record, not proof. Nothing here is financial advice.' })
+      el('p', { class: 'detail-note', text: 'The page recomputes this row from the snapshot figures as ' + fmtUsd(impliedOf(row)) + (impliedOf(row) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' Snapshot ' + DATA.as_of + '. Nothing here is financial advice.' })
     );
     dialog.appendChild(body);
     if (typeof dialog.showModal === 'function') {
@@ -466,7 +625,10 @@
     } else {
       dialog.setAttribute('open', '');
     }
+    body.setAttribute('tabindex', '-1');
+    body.focus();
   }
+
   function render() {
     app.textContent = '';
     var shell = el('div', { class: 'shell' });
@@ -475,6 +637,7 @@
     shell.appendChild(views());
     if (state.tab === 'board') {
       shell.appendChild(controls());
+      shell.appendChild(howItWorks());
       shell.appendChild(boardTable());
     } else if (state.tab === 'live') {
       shell.appendChild(el('div', { class: 'article' }, el('section', null, liveTable())));
